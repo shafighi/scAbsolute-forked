@@ -496,6 +496,7 @@ evaluateScalings <- function(segmCN, fiti, cellname,
           scaling.rpc_var=rpc.var, scaling.rpc_median=rpc.median, scaling.rpc_robust=rpc.robust,
           scaling.rpc_p95=rpc.p95, scaling.rpc_95=rpc.95, scaling.rpc_99=rpc.99), ddpl$df,
           dplyr::tibble(fit_flag=TRUE,
+          failure_reason=NA_character_,
           ploidy.continuous=ploidy.continuous, ploidy.mod=ploidy.mod,
           expected.variance=expected.variance,
           delta=delta, weight=weightsquared, delta_map=delta_map,
@@ -622,17 +623,25 @@ selectSolution <- function(segCN, fit, method, globalModel, predictFunction=NULL
                                        limitPloidy=limitPloidy, maxStates=maxStates, quick=FALSE, readPositionModel=readPositionModel))
   df = dplyr::bind_rows(dd)
 
+  # Separate failed cells (fit_flag=FALSE) before solution selection to avoid
+  # NaN/NA propagation into the model-based selection logic
+  failed_names <- unique((df %>% dplyr::filter(fit_flag == FALSE))$name)
+  df_failed <- df %>% dplyr::filter(name %in% failed_names)
+  df <- df %>% dplyr::filter(!name %in% failed_names)
+
+  if(nrow(df) == 0){
+    # All cells failed - no selection needed
+    transform = df_failed
+    df = df_failed  # preserve for debug protocolData
+  }else{
+
   df = df %>% dplyr::mutate(norm_error = error / scale, norm_error_ploidy = error / ploidy)
 
   ##################################################################################
   ### Crucial part - select final scaling solution                               ###
   # because of numeric instability, beta should not be included in the distinct here
   df = df %>% dplyr::distinct(name, error, ploidy, .keep_all = TRUE)
-  
-  if(dim(df)[[1]] == 1 && df$rpc == 0){
-    transform = df
-  }else{
-    
+
     # BEGIN select transform
     if (method == "error") {
       # simply select minimum error solution
@@ -697,7 +706,13 @@ selectSolution <- function(segCN, fit, method, globalModel, predictFunction=NULL
         # we don't select minimum residual (above code), but we choose an equivalence class of similar ploidy (based on size of ploidyWindow)
         # and we select minimum error within this equivalence class
         transform = df %>% dplyr::group_by(name) %>% dplyr::slice(which(sel_equivalence))
-  
+
+    }
+
+    # Recombine failed cells with selected passed-cell solutions
+    if(nrow(df_failed) > 0){
+      transform = dplyr::bind_rows(transform, df_failed)
+      df = dplyr::bind_rows(df, df_failed)
     }
   }
   # END select transform
@@ -962,29 +977,36 @@ scAbsolute <- function(input, method="error", globalModel=NULL,
     end_time <- Sys.time()
   }
   
-  failed_cells <- which(Biobase::pData(scaledCN)[["rpc"]] <= 0.0)
-  if(length(failed_cells) > 0){
-    for(fc in failed_cells){
+  passed_idx <- which(Biobase::pData(scaledCN)[["rpc"]] > 0.0)
+  failed_idx  <- which(Biobase::pData(scaledCN)[["rpc"]] <= 0.0)
+  if(length(failed_idx) > 0){
+    for(fc in failed_idx){
       warning(paste0("Cell FAILED: ", Biobase::pData(scaledCN)[["name"]][fc],
                      " (rpc=", Biobase::pData(scaledCN)[["rpc"]][fc],
                      ", ploidy=", Biobase::pData(scaledCN)[["ploidy"]][fc],
-                     ", used.reads=", Biobase::pData(scaledCN)[["used.reads"]][fc],
-                     ", failure_reason=", ifelse("failure_reason" %in% colnames(Biobase::pData(scaledCN)),
-                                                 Biobase::pData(scaledCN)[["failure_reason"]][fc], "unknown"), ")"))
-    }
-    if("fit_flag" %in% colnames(Biobase::pData(scaledCN))){
-      Biobase::pData(scaledCN)[["fit_flag"]][failed_cells] <- FALSE
+                     ", failure_reason=", Biobase::pData(scaledCN)[["failure_reason"]][fc], ")"))
     }
   }
-  stopifnot(all(Biobase::pData(scaledCN)[["rpc"]] > 0.0))
   print(paste0("F selectSolution runtime ",  difftime(end_time,start_time,units="mins")))
-  
-  ## 7. finalize segmentation by using HMM
+
+  if(length(passed_idx) == 0){
+    # All cells failed - return early; failure_reason already in pData from selectSolution
+    description <- Biobase::pData(scaledCN)
+    description$runtime = difftime(Sys.time(), program_start_time, units="mins")
+    Biobase::pData(scaledCN) = description
+    return(scaledCN)
+  }
+
+  ## 7. finalize segmentation by using HMM (skip failed cells)
   protData = Biobase::protocolData(scaledCN)
   start_time <- Sys.time()
-  scaledsegmentedCN = combineQDNASets(lapply(1:ncol(scaledCN), function(li){cs=copynumberSegmentation(scaledCN[,li], change_prob=change_prob,
-                                                                       max_iterations=max_iterations, max_states=max_states,
-                                                                       hmm_path=hmm_path, verbose=debug, gc_correction=gcCorrection, splitPerChromosome = splitPerChromosome); return(cs[["object"]])}))
+  scaledsegmentedCN = combineQDNASets(lapply(1:ncol(scaledCN), function(li){
+    if(li %in% failed_idx) return(scaledCN[,li])
+    cs = copynumberSegmentation(scaledCN[,li], change_prob=change_prob,
+                                max_iterations=max_iterations, max_states=max_states,
+                                hmm_path=hmm_path, verbose=debug, gc_correction=gcCorrection,
+                                splitPerChromosome=splitPerChromosome)
+    return(cs[["object"]])}))
   end_time <- Sys.time()
   Biobase::protocolData(scaledsegmentedCN) = protData
   print(paste0("G finalizeSegmentation runtime ",  difftime(end_time,start_time,units="mins")))
@@ -992,13 +1014,15 @@ scAbsolute <- function(input, method="error", globalModel=NULL,
   program_end_time <- Sys.time()
 
   if(!skipForEvaluation){
-    
+
       countdata = selectChromosomes(scaledsegmentedCN, exclude=c("X", "Y"))
-      alpha = c(); alpha_diploid = c(); alpha_lim = c();
-      for(cell in 1:ncol(countdata)){
-        alpha = c(alpha, estimate_overdispersion(countdata[, cell], robust=NULL))
-        alpha_diploid = c(alpha_diploid, estimate_overdispersion(countdata[, cell], robust=setdiff(seq(0, max_states), 2)))
-        alpha_lim = c(alpha_lim, estimate_overdispersion(countdata[, cell], robust=c(0, max_states-1)))
+      alpha = rep(NA_real_, ncol(countdata))
+      alpha_diploid = rep(NA_real_, ncol(countdata))
+      alpha_lim = rep(NA_real_, ncol(countdata))
+      for(cell in passed_idx){
+        alpha[cell] = estimate_overdispersion(countdata[, cell], robust=NULL)
+        alpha_diploid[cell] = estimate_overdispersion(countdata[, cell], robust=setdiff(seq(0, max_states), 2))
+        alpha_lim[cell] = estimate_overdispersion(countdata[, cell], robust=c(0, max_states-1))
       }
       
       description <- Biobase::pData(scaledsegmentedCN)
