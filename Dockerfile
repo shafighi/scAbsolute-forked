@@ -23,6 +23,8 @@ RUN Rscript -e "library(devtools); library(withr); \
         withr::with_libpaths(new = \"/opt/conda/envs/conda_runtime/lib/R/library\", \
         install_version(\"gfpop\",version=\"1.0.3\", repos=\"https://cloud.r-project.org\")); \
         withr::with_libpaths(new = \"/opt/conda/envs/conda_runtime/lib/R/library\", \
+        install_version(\"RcppArmadillo\", version=\"0.12.6.6.0\", repos=\"https://cloud.r-project.org\")); \
+        withr::with_libpaths(new = \"/opt/conda/envs/conda_runtime/lib/R/library\", \
         install_version(\"trend\",version=\"1.1.4\", repos=\"https://cloud.r-project.org\")); \
         withr::with_libpaths(new = \"/opt/conda/envs/conda_runtime/lib/R/library\", \
         install_version(\"infotheo\",version=\"1.2.0\", repos=\"https://cloud.r-project.org\"));"
