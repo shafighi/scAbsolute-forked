@@ -33,4 +33,4 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: glaux1126/scabsolute:v3.9.0
+          tags: dshshadi/scabsolute:v3.9.0
